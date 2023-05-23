@@ -599,17 +599,19 @@ func getSignatureAlgorithmFromAI(ai pkix.AlgorithmIdentifier) SignatureAlgorithm
 // RFC 3279, 2.3 Public Key Algorithms
 //
 // pkcs-1 OBJECT IDENTIFIER ::== { iso(1) member-body(2) us(840)
-//    rsadsi(113549) pkcs(1) 1 }
+//
+//	rsadsi(113549) pkcs(1) 1 }
 //
 // rsaEncryption OBJECT IDENTIFIER ::== { pkcs1-1 1 }
 //
 // id-dsa OBJECT IDENTIFIER ::== { iso(1) member-body(2) us(840)
-//    x9-57(10040) x9cm(4) 1 }
 //
-// RFC 5480, 2.1.1 Unrestricted Algorithm Identifier and Parameters
+//	x9-57(10040) x9cm(4) 1 }
 //
-// id-ecPublicKey OBJECT IDENTIFIER ::= {
-//       iso(1) member-body(2) us(840) ansi-X9-62(10045) keyType(2) 1 }
+// # RFC 5480, 2.1.1 Unrestricted Algorithm Identifier and Parameters
+//
+//	id-ecPublicKey OBJECT IDENTIFIER ::= {
+//	      iso(1) member-body(2) us(840) ansi-X9-62(10045) keyType(2) 1 }
 var (
 	oidPublicKeyRSA   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 	oidPublicKeyDSA   = asn1.ObjectIdentifier{1, 2, 840, 10040, 4, 1}
@@ -630,18 +632,18 @@ func getPublicKeyAlgorithmFromOID(oid asn1.ObjectIdentifier) PublicKeyAlgorithm 
 
 // RFC 5480, 2.1.1.1. Named Curve
 //
-// secp224r1 OBJECT IDENTIFIER ::= {
-//   iso(1) identified-organization(3) certicom(132) curve(0) 33 }
+//	secp224r1 OBJECT IDENTIFIER ::= {
+//	  iso(1) identified-organization(3) certicom(132) curve(0) 33 }
 //
-// secp256r1 OBJECT IDENTIFIER ::= {
-//   iso(1) member-body(2) us(840) ansi-X9-62(10045) curves(3)
-//   prime(1) 7 }
+//	secp256r1 OBJECT IDENTIFIER ::= {
+//	  iso(1) member-body(2) us(840) ansi-X9-62(10045) curves(3)
+//	  prime(1) 7 }
 //
-// secp384r1 OBJECT IDENTIFIER ::= {
-//   iso(1) identified-organization(3) certicom(132) curve(0) 34 }
+//	secp384r1 OBJECT IDENTIFIER ::= {
+//	  iso(1) identified-organization(3) certicom(132) curve(0) 34 }
 //
-// secp521r1 OBJECT IDENTIFIER ::= {
-//   iso(1) identified-organization(3) certicom(132) curve(0) 35 }
+//	secp521r1 OBJECT IDENTIFIER ::= {
+//	  iso(1) identified-organization(3) certicom(132) curve(0) 35 }
 //
 // NB: secp256r1 is equivalent to prime256v1
 var (
@@ -2289,6 +2291,146 @@ func CreateCertificateRequest(rand io.Reader, template *CertificateRequest, sign
 	})
 }
 
+// CreateCertificateRequestExtend creates a new certificate request based on a template.
+// The following members of template are used: Subject, Attributes,
+// SignatureAlgorithm, Extensions, DNSNames, EmailAddresses, and IPAddresses.
+// The private key is the private key of the signer.
+//
+// The returned slice is the certificate request in DER encoding.
+//
+// publicKey is sm2.PublicKey
+// signature is external sign by publicKey's privateKey
+func CreateCertificateRequestExtend(template *CertificateRequest, publicKey sm2.PublicKey, signature []byte) (csr []byte, err error) {
+	var sigAlgo pkix.AlgorithmIdentifier
+	_, sigAlgo, err = signingParamsForPublicKey(publicKey, template.SignatureAlgorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	var publicKeyBytes []byte
+	var publicKeyAlgorithm pkix.AlgorithmIdentifier
+	publicKeyBytes, publicKeyAlgorithm, err = marshalPublicKey(publicKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var extensions []pkix.Extension
+
+	if (len(template.DNSNames) > 0 || len(template.EmailAddresses) > 0 || len(template.IPAddresses) > 0) &&
+		!oidInExtensions(oidExtensionSubjectAltName, template.ExtraExtensions) {
+		sanBytes, err := marshalSANs(template.DNSNames, template.EmailAddresses, template.IPAddresses)
+		if err != nil {
+			return nil, err
+		}
+
+		extensions = append(extensions, pkix.Extension{
+			Id:    oidExtensionSubjectAltName,
+			Value: sanBytes,
+		})
+	}
+
+	extensions = append(extensions, template.ExtraExtensions...)
+
+	var attributes []pkix.AttributeTypeAndValueSET
+	attributes = append(attributes, template.Attributes...)
+
+	if len(extensions) > 0 {
+		// specifiedExtensions contains all the extensions that we
+		// found specified via template.Attributes.
+		specifiedExtensions := make(map[string]bool)
+
+		for _, atvSet := range template.Attributes {
+			if !atvSet.Type.Equal(oidExtensionRequest) {
+				continue
+			}
+
+			for _, atvs := range atvSet.Value {
+				for _, atv := range atvs {
+					specifiedExtensions[atv.Type.String()] = true
+				}
+			}
+		}
+
+		atvs := make([]pkix.AttributeTypeAndValue, 0, len(extensions))
+		for _, e := range extensions {
+			if specifiedExtensions[e.Id.String()] {
+				// Attributes already contained a value for
+				// this extension and it takes priority.
+				continue
+			}
+
+			atvs = append(atvs, pkix.AttributeTypeAndValue{
+				// There is no place for the critical flag in a CSR.
+				Type:  e.Id,
+				Value: e.Value,
+			})
+		}
+
+		// Append the extensions to an existing attribute if possible.
+		appended := false
+		for _, atvSet := range attributes {
+			if !atvSet.Type.Equal(oidExtensionRequest) || len(atvSet.Value) == 0 {
+				continue
+			}
+
+			atvSet.Value[0] = append(atvSet.Value[0], atvs...)
+			appended = true
+			break
+		}
+
+		// Otherwise, add a new attribute for the extensions.
+		if !appended {
+			attributes = append(attributes, pkix.AttributeTypeAndValueSET{
+				Type: oidExtensionRequest,
+				Value: [][]pkix.AttributeTypeAndValue{
+					atvs,
+				},
+			})
+		}
+	}
+
+	asn1Subject := template.RawSubject
+	if len(asn1Subject) == 0 {
+		asn1Subject, err = asn1.Marshal(template.Subject.ToRDNSequence())
+		if err != nil {
+			return
+		}
+	}
+
+	rawAttributes, err := newRawAttributes(attributes)
+	if err != nil {
+		return
+	}
+
+	tbsCSR := tbsCertificateRequest{
+		Version: 0, // PKCS #10, RFC 2986
+		Subject: asn1.RawValue{FullBytes: asn1Subject},
+		PublicKey: publicKeyInfo{
+			Algorithm: publicKeyAlgorithm,
+			PublicKey: asn1.BitString{
+				Bytes:     publicKeyBytes,
+				BitLength: len(publicKeyBytes) * 8,
+			},
+		},
+		RawAttributes: rawAttributes,
+	}
+
+	tbsCSRContents, err := asn1.Marshal(tbsCSR)
+	if err != nil {
+		return
+	}
+	tbsCSR.Raw = tbsCSRContents
+
+	return asn1.Marshal(certificateRequest{
+		TBSCSR:             tbsCSR,
+		SignatureAlgorithm: sigAlgo,
+		SignatureValue: asn1.BitString{
+			Bytes:     signature,
+			BitLength: len(signature) * 8,
+		},
+	})
+}
+
 // ParseCertificateRequest parses a single certificate request from the
 // given ASN.1 DER data.
 func ParseCertificateRequest(asn1Data []byte) (*CertificateRequest, error) {
@@ -2592,7 +2734,7 @@ func CreateRevocationList(rand io.Reader, template *RevocationList, issuer *Cert
 	if template.SignatureAlgorithm.isRSAPSS() {
 		signerOpts = &rsa.PSSOptions{
 			SaltLength: rsa.PSSSaltLengthEqualsHash,
-			Hash: crypto.Hash(hashFunc),
+			Hash:       crypto.Hash(hashFunc),
 		}
 	}
 
